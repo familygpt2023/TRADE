@@ -14,12 +14,14 @@ import json
 import re
 import sys
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+
 FEED_URL = "https://www.financialjuice.com/feed.ashx?xy=rss"
+HOME_URL = "https://www.financialjuice.com/home"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -45,49 +47,71 @@ TAGS = {
 }
 
 
+def _make_item(guid, title, link, published):
+    title = re.sub(r"^FinancialJuice:\s*", "", title.strip(), flags=re.I)
+    return {
+        "id": guid or link or title,
+        "title": title,
+        "link": link,
+        "published": published.isoformat() if published else None,
+        "tags": [k for k, rx in TAGS.items() if re.search(rx, title, re.I)],
+    }
+
+
 def parse_feed(xml_bytes):
-    """Return a list of {id, title, link, published} dicts, newest first."""
-    root = ET.fromstring(xml_bytes)
+    """Parse the RSS feed with BeautifulSoup. Newest first."""
+    soup = BeautifulSoup(xml_bytes, "xml")
     items = []
-    for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
-        title = re.sub(r"^FinancialJuice:\s*", "", title, flags=re.I)
-        link = (it.findtext("link") or "").strip()
-        guid = (it.findtext("guid") or link or title).strip()
-        pub_raw = (it.findtext("pubDate") or "").strip()
-        try:
-            published = parsedate_to_datetime(pub_raw).astimezone(timezone.utc)
-        except (TypeError, ValueError):
-            published = None
+    for it in soup.find_all("item"):
+        def txt(tag):
+            el = it.find(tag)
+            return el.get_text(strip=True) if el else ""
+
+        title = txt("title")
         if not title:
             continue
-        items.append(
-            {
-                "id": guid,
-                "title": title,
-                "link": link,
-                "published": published.isoformat() if published else None,
-                "tags": [k for k, rx in TAGS.items() if re.search(rx, title, re.I)],
-            }
-        )
+        try:
+            published = parsedate_to_datetime(txt("pubDate")).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            published = None
+        items.append(_make_item(txt("guid"), title, txt("link"), published))
     items.sort(key=lambda x: x["published"] or "", reverse=True)
     return items
 
 
-def fetch_feed(retries=3):
+def parse_home_html(html):
+    """Best-effort fallback: read headline elements from the home page HTML.
+
+    The live page loads its headlines with JavaScript, so plain HTML may contain
+    none. Selectors are guesses; adjust after inspecting the real markup.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    seen, items = set(), []
+    for el in soup.select('[class*="headline"], [class*="news-title"], [class*="infoTitle"]'):
+        title = el.get_text(" ", strip=True)
+        if len(title) < 15 or title in seen:
+            continue
+        seen.add(title)
+        a = el.find("a") or el.find_parent("a")
+        link = a["href"] if a and a.has_attr("href") else ""
+        items.append(_make_item(link or title, title, link, None))
+    return items
+
+
+def fetch_url(url, retries=3):
     import requests
 
     last = None
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(FEED_URL, headers=HEADERS, timeout=20)
+            r = requests.get(url, headers=HEADERS, timeout=20)
             if r.status_code == 200 and r.content:
                 return r.content
             last = f"HTTP {r.status_code}"
         except requests.RequestException as e:
             last = str(e)
         time.sleep(2 * attempt)
-    raise RuntimeError(f"could not fetch {FEED_URL}: {last}")
+    raise RuntimeError(f"could not fetch {url}: {last}")
 
 
 def load_seen():
@@ -147,10 +171,17 @@ def main():
         return self_test()
 
     try:
-        items = parse_feed(fetch_feed())
+        items = parse_feed(fetch_url(FEED_URL))
     except Exception as e:  # network block, bad XML, etc.
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(2)
+        print(f"RSS failed ({e}); trying home page HTML", file=sys.stderr)
+        try:
+            items = parse_home_html(fetch_url(HOME_URL).decode("utf-8", "replace"))
+        except Exception as e2:
+            print(f"ERROR: {e2}", file=sys.stderr)
+            sys.exit(2)
+        if not items:
+            print("ERROR: home page had no headlines (likely JavaScript-rendered)", file=sys.stderr)
+            sys.exit(2)
 
     seen = load_seen()
     new_items = [i for i in items if i["id"] not in seen]
